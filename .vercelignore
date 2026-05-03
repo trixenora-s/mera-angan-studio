@@ -1,0 +1,10 @@
+.env.example
+.env.local
+README.md
+supabase-schema.sql
+cdb.bat
+scripts/
+.git/
+.gitignore
+node_modules/
+.next/

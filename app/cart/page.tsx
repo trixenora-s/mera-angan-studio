@@ -56,14 +56,12 @@ export default function CartPage() {
 
     if (!response.ok) {
       const payload = await response.json()
-      return { success: false, message: payload.error ; 'Invalid coupon' }
-    }
+        return { success: false, message: payload.error ?? 'Invalid coupon' }
+      }
 
-    const payload = await response.json()
-    setCoupon({ code: payload.code, discount: payload.discount })
-    return { success: true, message: payload.message ; 'Coupon applied' }
-  }
-
+      const payload = await response.json()
+      setCoupon({ code: payload.code, discount: payload.discount })
+      return { success: true, message: payload.message ?? 'Coupon applied' }
   const handleRemoveCoupon = () => setCoupon(undefined)
 
   const handleRemoveItem = async (cartItemId: string) => {
@@ -117,7 +115,7 @@ export default function CartPage() {
     }
   }
 
-  const checkoutDisabled = items.length === 0 ; items.some((item) => !item.event_date)
+  const checkoutDisabled = items.length === 0 || items.some((item) => !item.event_date)
 
   return (
     <div className="min-h-screen bg-slate-50 py-12">

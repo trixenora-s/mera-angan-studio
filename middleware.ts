@@ -7,8 +7,7 @@ export async function middleware(req: NextRequest) {
   const isAdmin = token?.role === 'admin'
   const pathname = req.nextUrl.pathname
 
-  const protectedRoutes = ['/profile', '/cart', '/checkout']
-  const adminPath = '/admin'
+  const protectedRoutes = ['/profile', '/cart', '/checkout', '/orders']
   const adminApiPath = '/api/admin'
 
   if (protectedRoutes.some((route) => pathname.startsWith(route)) && !isLoggedIn) {
@@ -17,19 +16,20 @@ export async function middleware(req: NextRequest) {
     return NextResponse.redirect(loginUrl)
   }
 
-  if (pathname.startsWith(adminPath) && !isAdmin) {
-    if (pathname.startsWith(adminApiPath)) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+  if (pathname.startsWith('/admin') && !isAdmin) {
+    return NextResponse.redirect(new URL('/', req.url))
+  }
 
-    const loginUrl = new URL('/auth/login', req.url)
-    loginUrl.searchParams.set('callbackUrl', req.url)
-    return NextResponse.redirect(loginUrl)
+  if (pathname.startsWith(adminApiPath) && !isAdmin) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
   return NextResponse.next()
 }
 
 export const config = {
-  matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)', '/api/admin/:path*'],
+  matcher: [
+    '/((?!api|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
+    '/api/admin/:path*',
+  ],
 }

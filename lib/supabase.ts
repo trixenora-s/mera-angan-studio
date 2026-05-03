@@ -1,33 +1,82 @@
 /**
- * Neon PostgreSQL Database Client
- * Replaces Supabase with direct PostgreSQL connection
- * 
- * Usage:
- * - Server-side: Use db.query() for direct queries
- * - For ORM: Consider adding Prisma or Drizzle
+ * Neon PostgreSQL helper utilities.
+ *
+ * This file exposes a direct Neon database pool and also preserves
+ * legacy Supabase client helpers when Supabase environment variables are configured.
  */
 
 import { Pool, QueryResult } from 'pg'
 import { cache } from 'react'
+import { cookies } from 'next/headers'
+import { createClient } from '@supabase/supabase-js'
+import { createServerClient } from '@supabase/auth-helpers-nextjs'
 
-// Database connection pool
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+const neonDatabaseUrl = process.env.NEON_DATABASE_URL || process.env.DATABASE_URL
+const neonDirectDatabaseUrl = process.env.NEON_DIRECT_DATABASE_URL || process.env.DIRECT_DATABASE_URL || neonDatabaseUrl
+
+if (!neonDatabaseUrl) {
+  throw new Error('Missing Neon database environment variables: NEON_DATABASE_URL or DATABASE_URL')
+}
+
+if (!supabaseUrl || !supabaseAnonKey || !supabaseServiceRoleKey) {
+  console.warn('Supabase environment variables not detected. Legacy Supabase clients will remain available if configured, but the Neon database pool will still connect via DATABASE_URL.')
+}
+
+export const supabase = supabaseUrl && supabaseAnonKey
+  ? createClient(supabaseUrl, supabaseAnonKey, {
+      auth: {
+        autoRefreshToken: true,
+        persistSession: true,
+      },
+    })
+  : null
+
+export const supabaseAdmin = supabaseUrl && supabaseServiceRoleKey
+  ? createClient(supabaseUrl, supabaseServiceRoleKey, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+      },
+    })
+  : null
+
+export const createClientServer = cache(() => {
+  if (!supabaseUrl || !supabaseAnonKey) {
+    throw new Error('Supabase server client requires NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY')
+  }
+
+  return createServerClient(supabaseUrl, supabaseAnonKey, {
+    cookies: {
+      getAll: () => cookies().getAll().map((cookie) => ({
+        name: cookie.name,
+        value: cookie.value,
+        options: {},
+      })),
+    },
+  })
+})
+
+export const createServiceRoleClient = () => {
+  if (!supabaseAdmin) {
+    throw new Error('Supabase service role client requires SUPABASE_SERVICE_ROLE_KEY')
+  }
+  return supabaseAdmin
+}
+
+// Database connection pool for direct SQL examples
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: neonDirectDatabaseUrl,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
   max: 20,
 })
 
-// Error handling
 pool.on('error', (err) => {
   console.error('Unexpected error on idle client', err)
 })
 
-/**
- * Execute a query with parameters
- * @param text SQL query string
- * @param params Query parameters
- * @returns Query result
- */
 export const query = async (text: string, params?: any[]): Promise<QueryResult> => {
   const start = Date.now()
   try {
@@ -41,18 +90,11 @@ export const query = async (text: string, params?: any[]): Promise<QueryResult> 
   }
 }
 
-/**
- * Get a client from the pool for transactions
- */
 export const getClient = async () => {
   const client = await pool.connect()
   return client
 }
 
-/**
- * Execute multiple queries in a transaction
- * @param queries Array of {text, params} objects
- */
 export const transaction = async (queries: Array<{ text: string; params?: any[] }>) => {
   const client = await pool.connect()
   try {
@@ -72,16 +114,10 @@ export const transaction = async (queries: Array<{ text: string; params?: any[] 
   }
 }
 
-/**
- * Close the connection pool
- */
 export const closePool = async () => {
   await pool.end()
 }
 
-/**
- * Health check for database connection
- */
 export const healthCheck = async (): Promise<boolean> => {
   try {
     await pool.query('SELECT NOW()')
@@ -92,14 +128,10 @@ export const healthCheck = async (): Promise<boolean> => {
   }
 }
 
-// Cached database instance for server operations
 export const db = cache(() => ({
   query,
   getClient,
   transaction,
 }))
 
-/**
- * Re-export pool for advanced usage
- */
 export default pool

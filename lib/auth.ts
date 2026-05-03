@@ -1,23 +1,128 @@
-import { AuthOptions, type DefaultSession } from 'next-auth'
-import type { JWT } from 'next-auth/jwt'
-import GoogleProvider from 'next-auth/providers/google'
-import CredentialsProvider from 'next-auth/providers/credentials'
-import { createServiceRoleClient } from './supabase'
-import { consumePhoneLoginToken } from './rate-limit'
+import NextAuth from 'next-auth'
+import Google from 'next-auth/providers/google'
+import Credentials from 'next-auth/providers/credentials'
+import { supabase } from './supabase'
+import { z } from 'zod'
 
-declare module 'next-auth' {
-  interface Session extends DefaultSession {
-    user: DefaultSession['user'] & {
-      id: string
-      phone?: string | null
-      role?: 'user' | 'admin'
-    }
-  }
+const phoneSchema = z.object({
+  phone: z.string().regex(/^\+91\d{10}$/, 'Invalid phone number'),
+  otp: z.string().length(6, 'OTP must be 6 digits'),
+})
 
-  interface User {
-    id: string
-    phone?: string
-    avatar_url?: string | null
+export const { handlers, auth, signIn, signOut } = NextAuth({
+  providers: [
+    Google({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    }),
+    Credentials({
+      name: 'phone',
+      credentials: {
+        phone: { label: 'Phone', type: 'tel' },
+        token: { label: 'Token', type: 'text' },
+      },
+      async authorize(credentials) {
+        try {
+          const { phone, token } = credentials as { phone: string; token: string }
+
+          // Verify token from Redis
+          const { consumePhoneLoginToken } = await import('./rate-limit')
+          const valid = await consumePhoneLoginToken(phone, token)
+          if (!valid) {
+            return null
+          }
+
+          // Find user profile
+          const { data: profile } = await supabase
+            .from('profiles')
+            .select('*')
+            .eq('phone', phone)
+            .single()
+
+          if (!profile) {
+            return null
+          }
+
+          return {
+            id: profile.id,
+            phone: profile.phone,
+            email: profile.email,
+            name: profile.full_name,
+            image: profile.avatar_url,
+            role: profile.role,
+          }
+        } catch (error) {
+          console.error('Phone auth error:', error)
+          return null
+        }
+      },
+    }),
+  ],
+  callbacks: {
+    async signIn({ user, account, profile }) {
+      if (account?.provider === 'google') {
+        try {
+          // Find or create user profile
+          let { data: existingProfile } = await supabase
+            .from('profiles')
+            .select('*')
+            .eq('email', user.email)
+            .single()
+
+          if (!existingProfile) {
+            const { data: newProfile, error } = await supabase
+              .from('profiles')
+              .insert({
+                email: user.email!,
+                full_name: user.name,
+                avatar_url: user.image,
+              })
+              .select()
+              .single()
+
+            if (error) throw error
+            existingProfile = newProfile
+          } else {
+            // Update avatar and name if changed
+            await supabase
+              .from('profiles')
+              .update({
+                full_name: user.name,
+                avatar_url: user.image,
+              })
+              .eq('id', existingProfile.id)
+          }
+
+          user.id = existingProfile.id
+          user.role = existingProfile.role
+        } catch (error) {
+          console.error('Google sign in error:', error)
+          return false
+        }
+      }
+      return true
+    },
+    async jwt({ token, user }) {
+      if (user) {
+        token.id = user.id
+        token.role = user.role
+      }
+      return token
+    },
+    async session({ session, token }) {
+      session.user.id = token.id as string
+      session.user.role = token.role as 'user' | 'admin'
+      return session
+    },
+  },
+  pages: {
+    signIn: '/auth/login',
+    error: '/auth/login',
+  },
+  session: {
+    strategy: 'jwt',
+  },
+})
     role?: 'user' | 'admin'
   }
 }

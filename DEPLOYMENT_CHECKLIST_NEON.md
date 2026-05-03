@@ -4,14 +4,15 @@ Complete this checklist before deploying your application to production.
 
 ## ✅ Local Setup
 
-- [ ] Install dependencies: `npm install pg @types/pg`
+- [ ] Install dependencies: `npm install`
+- [ ] Confirm `pg` and `@types/pg` are in `package.json`
 - [ ] Get Neon connection URL from [console.neon.tech](https://console.neon.tech)
 - [ ] Update `.env` with database URLs
 - [ ] Database schema imported to Neon
 - [ ] Test locally: `npm run dev`
 - [ ] All API routes updated to use `query()` function
 - [ ] NextAuth configured for PostgreSQL
-- [ ] No Supabase imports remaining in codebase
+- [ ] No legacy database provider references remain
 - [ ] Test database queries work locally
 
 ## 🔐 Security
@@ -72,7 +73,7 @@ vercel env add razorpay_key_secret
 ### Step 2: Verify vercel.json
 - [ ] `vercel.json` updated with Neon secrets
 - [ ] All secret references use `@secret_name` format
-- [ ] No Supabase references remain
+- [ ] No legacy database provider references remain
 
 ### Step 3: Deploy
 ```bash
@@ -170,12 +171,10 @@ git push
 - [ ] Backups configured (Neon does automatic backups)
 - [ ] Team trained on new database system
 - [ ] Documentation updated
-- [ ] Old Supabase account can be deleted (after confirmation)
 
 ## 📝 Notes
 
 **Database Migration Details:**
-- Old Supabase database: qebawwfpbnlsvreqxljw
 - New Neon database: [Your Neon project name]
 - Migration date: [Date]
 - Completed by: [Your name]

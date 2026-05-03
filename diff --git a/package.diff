@@ -1,0 +1,1065 @@
+diff --git a/package.json b/package.json
+--- package.json
++++ package.json
+@@ -19,10 +19,8 @@
+     "zustand": "^4.4.0",
+     "@tanstack/react-query": "^5.0.0",
+     "react-hook-form": "^7.47.0",
+     "zod": "^3.22.0",
+-    "@supabase/supabase-js": "^2.38.0",
+-    "@supabase/auth-helpers-nextjs": "^0.7.7",
+     "next-auth": "^4.24.7",
+     "lucide-react": "^0.292.0",
+     "clsx": "^2.0.0",
+     "tailwind-merge": "^2.2.0",
+@@ -31,9 +29,12 @@
+     "@upstash/ratelimit": "latest",
+     "twilio": "^4.12.0",
+     "yet-another-react-lightbox": "^3.25.0",
+     "react-countup": "^6.5.3",
+-    "resend": "^0.17.1"
++    "resend": "^0.17.1",
++    "pg": "^8.11.0",
++    "@supabase/auth-helpers-nextjs": "^0.15.0",
++    "@supabase/supabase-js": "^2.105.1"
+   },
+   "devDependencies": {
+     "typescript": "^5.0.0",
+     "@types/node": "^20.0.0",
+diff --git a/DEPLOYMENT_CHECKLIST_NEON.md b/DEPLOYMENT_CHECKLIST_NEON.md
+--- DEPLOYMENT_CHECKLIST_NEON.md
++++ DEPLOYMENT_CHECKLIST_NEON.md
+@@ -3,16 +3,17 @@
+ Complete this checklist before deploying your application to production.
+ 
+ ## ✅ Local Setup
+ 
+-- [ ] Install dependencies: `npm install pg @types/pg`
++- [ ] Install dependencies: `npm install`
++- [ ] Confirm `pg` and `@types/pg` are in `package.json`
+ - [ ] Get Neon connection URL from [console.neon.tech](https://console.neon.tech)
+ - [ ] Update `.env` with database URLs
+ - [ ] Database schema imported to Neon
+ - [ ] Test locally: `npm run dev`
+ - [ ] All API routes updated to use `query()` function
+ - [ ] NextAuth configured for PostgreSQL
+-- [ ] No Supabase imports remaining in codebase
++- [ ] No legacy database provider references remain
+ - [ ] Test database queries work locally
+ 
+ ## 🔐 Security
+ 
+@@ -71,9 +72,9 @@
+ 
+ ### Step 2: Verify vercel.json
+ - [ ] `vercel.json` updated with Neon secrets
+ - [ ] All secret references use `@secret_name` format
+-- [ ] No Supabase references remain
++- [ ] No legacy database provider references remain
+ 
+ ### Step 3: Deploy
+ ```bash
+ # Deploy to production
+@@ -169,14 +170,12 @@
+ - [ ] Database running smoothly
+ - [ ] Backups configured (Neon does automatic backups)
+ - [ ] Team trained on new database system
+ - [ ] Documentation updated
+-- [ ] Old Supabase account can be deleted (after confirmation)
+ 
+ ## 📝 Notes
+ 
+ **Database Migration Details:**
+-- Old Supabase database: qebawwfpbnlsvreqxljw
+ - New Neon database: [Your Neon project name]
+ - Migration date: [Date]
+ - Completed by: [Your name]
+ 
+diff --git a/lib/auth.ts b/lib/auth.ts
+--- lib/auth.ts
++++ lib/auth.ts
+@@ -1,24 +1,129 @@
+-import { AuthOptions, type DefaultSession } from 'next-auth'
+-import type { JWT } from 'next-auth/jwt'
+-import GoogleProvider from 'next-auth/providers/google'
+-import CredentialsProvider from 'next-auth/providers/credentials'
+-import { createServiceRoleClient } from './supabase'
+-import { consumePhoneLoginToken } from './rate-limit'
++import NextAuth from 'next-auth'
++import Google from 'next-auth/providers/google'
++import Credentials from 'next-auth/providers/credentials'
++import { supabase } from './supabase'
++import { z } from 'zod'
+ 
+-declare module 'next-auth' {
+-  interface Session extends DefaultSession {
+-    user: DefaultSession['user'] & {
+-      id: string
+-      phone?: string | null
+-      role?: 'user' | 'admin'
+-    }
+-  }
++const phoneSchema = z.object({
++  phone: z.string().regex(/^\+91\d{10}$/, 'Invalid phone number'),
++  otp: z.string().length(6, 'OTP must be 6 digits'),
++})
+ 
+-  interface User {
+-    id: string
+-    phone?: string
+-    avatar_url?: string | null
++export const { handlers, auth, signIn, signOut } = NextAuth({
++  providers: [
++    Google({
++      clientId: process.env.GOOGLE_CLIENT_ID!,
++      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
++    }),
++    Credentials({
++      name: 'phone',
++      credentials: {
++        phone: { label: 'Phone', type: 'tel' },
++        token: { label: 'Token', type: 'text' },
++      },
++      async authorize(credentials) {
++        try {
++          const { phone, token } = credentials as { phone: string; token: string }
++
++          // Verify token from Redis
++          const { consumePhoneLoginToken } = await import('./rate-limit')
++          const valid = await consumePhoneLoginToken(phone, token)
++          if (!valid) {
++            return null
++          }
++
++          // Find user profile
++          const { data: profile } = await supabase
++            .from('profiles')
++            .select('*')
++            .eq('phone', phone)
++            .single()
++
++          if (!profile) {
++            return null
++          }
++
++          return {
++            id: profile.id,
++            phone: profile.phone,
++            email: profile.email,
++            name: profile.full_name,
++            image: profile.avatar_url,
++            role: profile.role,
++          }
++        } catch (error) {
++          console.error('Phone auth error:', error)
++          return null
++        }
++      },
++    }),
++  ],
++  callbacks: {
++    async signIn({ user, account, profile }) {
++      if (account?.provider === 'google') {
++        try {
++          // Find or create user profile
++          let { data: existingProfile } = await supabase
++            .from('profiles')
++            .select('*')
++            .eq('email', user.email)
++            .single()
++
++          if (!existingProfile) {
++            const { data: newProfile, error } = await supabase
++              .from('profiles')
++              .insert({
++                email: user.email!,
++                full_name: user.name,
++                avatar_url: user.image,
++              })
++              .select()
++              .single()
++
++            if (error) throw error
++            existingProfile = newProfile
++          } else {
++            // Update avatar and name if changed
++            await supabase
++              .from('profiles')
++              .update({
++                full_name: user.name,
++                avatar_url: user.image,
++              })
++              .eq('id', existingProfile.id)
++          }
++
++          user.id = existingProfile.id
++          user.role = existingProfile.role
++        } catch (error) {
++          console.error('Google sign in error:', error)
++          return false
++        }
++      }
++      return true
++    },
++    async jwt({ token, user }) {
++      if (user) {
++        token.id = user.id
++        token.role = user.role
++      }
++      return token
++    },
++    async session({ session, token }) {
++      session.user.id = token.id as string
++      session.user.role = token.role as 'user' | 'admin'
++      return session
++    },
++  },
++  pages: {
++    signIn: '/auth/login',
++    error: '/auth/login',
++  },
++  session: {
++    strategy: 'jwt',
++  },
++})
+     role?: 'user' | 'admin'
+   }
+ }
+ 
+diff --git a/middleware.ts b/middleware.ts
+--- middleware.ts
++++ middleware.ts
+@@ -6,30 +6,30 @@
+   const isLoggedIn = Boolean(token)
+   const isAdmin = token?.role === 'admin'
+   const pathname = req.nextUrl.pathname
+ 
+-  const protectedRoutes = ['/profile', '/cart', '/checkout']
+-  const adminPath = '/admin'
++  const protectedRoutes = ['/profile', '/cart', '/checkout', '/orders']
+   const adminApiPath = '/api/admin'
+ 
+   if (protectedRoutes.some((route) => pathname.startsWith(route)) && !isLoggedIn) {
+     const loginUrl = new URL('/auth/login', req.url)
+     loginUrl.searchParams.set('callbackUrl', req.url)
+     return NextResponse.redirect(loginUrl)
+   }
+ 
+-  if (pathname.startsWith(adminPath) && !isAdmin) {
+-    if (pathname.startsWith(adminApiPath)) {
+-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+-    }
++  if (pathname.startsWith('/admin') && !isAdmin) {
++    return NextResponse.redirect(new URL('/', req.url))
++  }
+ 
+-    const loginUrl = new URL('/auth/login', req.url)
+-    loginUrl.searchParams.set('callbackUrl', req.url)
+-    return NextResponse.redirect(loginUrl)
++  if (pathname.startsWith(adminApiPath) && !isAdmin) {
++    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+   }
+ 
+   return NextResponse.next()
+ }
+ 
+ export const config = {
+-  matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)', '/api/admin/:path*'],
++  matcher: [
++    '/((?!api|_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
++    '/api/admin/:path*',
++  ],
+ }
+\ No newline at end of file
+diff --git a/components/layout/Header.tsx b/components/layout/Header.tsx
+--- components/layout/Header.tsx
++++ components/layout/Header.tsx
+@@ -1,54 +1,246 @@
+ 'use client'
+ 
++import { useState, useEffect } from 'react'
+ import Link from 'next/link'
+-import { useSession, signIn, signOut } from 'next-auth/react'
++import { usePathname } from 'next/navigation'
++import { useSession, signOut } from 'next-auth/react'
+ import { useCart } from '@/hooks/useCart'
+-import { useWishlist } from '@/hooks/useWishlist'
+-import { ROUTES } from '@/constants/routes'
+ import { SearchBar } from '@/components/ui/SearchBar'
+ import { MobileNav } from './MobileNav'
++import { ChevronDown, ShoppingBag, User, LogOut, Package, Heart, MapPin, Bell } from 'lucide-react'
+ 
+ export function Header() {
+   const { data: session } = useSession()
+   const { getItemCount } = useCart()
+-  const { productIds } = useWishlist()
++  const pathname = usePathname()
++  const [isScrolled, setIsScrolled] = useState(false)
++  const [isEventsOpen, setIsEventsOpen] = useState(false)
++  const [isProfileOpen, setIsProfileOpen] = useState(false)
+ 
++  useEffect(() => {
++    const handleScroll = () => {
++      setIsScrolled(window.scrollY > 10)
++    }
++    window.addEventListener('scroll', handleScroll)
++    return () => window.removeEventListener('scroll', handleScroll)
++  }, [])
++
++  const eventCategories = [
++    { name: 'Anniversaries', slug: 'anniversaries' },
++    { name: 'Annaprashan', slug: 'annaprashan' },
++    { name: 'Baby Born / Naamkaran', slug: 'naamkaran' },
++    { name: 'Baby Shower (Godh Bharai)', slug: 'baby-shower' },
++    { name: 'Birthdays', slug: 'birthdays' },
++    { name: 'Diwali / Dhanteras', slug: 'diwali-dhanteras' },
++    { name: 'Engagement', slug: 'engagement' },
++    { name: 'Haldi Ceremony', slug: 'haldi' },
++    { name: 'Janmashtami', slug: 'janmashtami' },
++    { name: 'Mehendi Ceremony', slug: 'mehendi' },
++    { name: 'New Year\'s Eve', slug: 'new-years-eve' },
++    { name: 'Office / Shop Inaugurations', slug: 'inauguration' },
++    { name: 'Reception', slug: 'reception' },
++    { name: 'Surprise Proposals', slug: 'proposals' },
++    { name: 'Wedding Ceremony', slug: 'wedding' },
++  ]
++
+   return (
+-    <header className="fixed inset-x-0 top-0 z-50 border-b border-slate-200 bg-white/95 shadow-sm backdrop-blur-xl">
+-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+-        <div className="flex h-16 items-center justify-between">
++    <header className={`fixed inset-x-0 top-0 z-50 h-16 md:h-20 transition-all duration-300 ${
++      isScrolled ? 'bg-white/95 backdrop-blur-xl shadow-lg' : 'bg-white'
++    }`}>
++      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-full">
++        <div className="flex items-center justify-between h-full">
+           {/* Logo */}
+-          <Link href={ROUTES.HOME} className="text-2xl font-bold text-primary-600">
++          <Link href="/" className="text-xl md:text-2xl font-bold text-primary-600 shrink-0">
+             EventDecor
+           </Link>
+ 
+-          {/* Navigation */}
+-          <nav className="hidden md:flex space-x-8">
+-            <Link href={ROUTES.EVENTS} className="text-gray-700 hover:text-primary-600">
+-              Events
++          {/* Search Bar - Centered */}
++          <div className="hidden md:block flex-1 max-w-md mx-8">
++            <SearchBar />
++          </div>
++
++          {/* Desktop Navigation */}
++          <nav className="hidden md:flex items-center space-x-8">
++            <Link
++              href="/"
++              className={`transition-colors ${
++                pathname === '/' ? 'text-primary-600 border-b-2 border-primary-600' : 'text-gray-700 hover:text-primary-600'
++              }`}
++            >
++              Home
+             </Link>
+-            <Link href={ROUTES.GALLERY} className="text-gray-700 hover:text-primary-600">
++
++            {/* Events Mega Dropdown */}
++            <div className="relative">
++              <button
++                onMouseEnter={() => setIsEventsOpen(true)}
++                onMouseLeave={() => setIsEventsOpen(false)}
++                className={`flex items-center space-x-1 transition-colors ${
++                  pathname.startsWith('/events') ? 'text-primary-600 border-b-2 border-primary-600' : 'text-gray-700 hover:text-primary-600'
++                }`}
++              >
++                <span>Events</span>
++                <ChevronDown className="w-4 h-4" />
++              </button>
++
++              {isEventsOpen && (
++                <div
++                  className="absolute top-full left-0 mt-2 w-screen max-w-4xl bg-white border border-gray-200 rounded-lg shadow-xl"
++                  onMouseEnter={() => setIsEventsOpen(true)}
++                  onMouseLeave={() => setIsEventsOpen(false)}
++                >
++                  <div className="grid grid-cols-2 gap-0">
++                    <div className="p-6">
++                      <h3 className="text-sm font-semibold text-gray-900 mb-4">Browse by Event</h3>
++                      <div className="grid grid-cols-1 gap-2">
++                        {eventCategories.map((category) => (
++                          <Link
++                            key={category.slug}
++                            href={`/events/${category.slug}`}
++                            className="text-sm text-gray-700 hover:text-primary-600 transition-colors"
++                          >
++                            {category.name}
++                          </Link>
++                        ))}
++                      </div>
++                    </div>
++                    <div className="p-6 bg-gray-50 rounded-r-lg">
++                      <div className="bg-white rounded-lg p-4 shadow-sm">
++                        <img src="/placeholder-event.jpg" alt="Featured Event" className="w-full h-32 object-cover rounded mb-3" />
++                        <h4 className="font-semibold text-gray-900 mb-1">Wedding Decorations</h4>
++                        <p className="text-sm text-gray-600 mb-3">Make your special day unforgettable</p>
++                        <Link href="/events/wedding" className="text-primary-600 text-sm font-medium hover:underline">
++                          Explore →
++                        </Link>
++                      </div>
++                    </div>
++                  </div>
++                </div>
++              )}
++            </div>
++
++            <Link
++              href="/gallery"
++              className={`transition-colors ${
++                pathname === '/gallery' ? 'text-primary-600 border-b-2 border-primary-600' : 'text-gray-700 hover:text-primary-600'
++              }`}
++            >
+               Gallery
+             </Link>
+-            <Link href={ROUTES.ABOUT} className="text-gray-700 hover:text-primary-600">
++
++            <Link
++              href="/contact"
++              className={`transition-colors ${
++                pathname === '/contact' ? 'text-primary-600 border-b-2 border-primary-600' : 'text-gray-700 hover:text-primary-600'
++              }`}
++            >
++              Contact
++            </Link>
++
++            <Link
++              href="/about"
++              className={`transition-colors ${
++                pathname === '/about' ? 'text-primary-600 border-b-2 border-primary-600' : 'text-gray-700 hover:text-primary-600'
++              }`}
++            >
+               About
+             </Link>
+-            <Link href={ROUTES.CONTACT} className="text-gray-700 hover:text-primary-600">
+-              Contact
+-            </Link>
+           </nav>
+ 
+-          {/* Search Bar */}
+-          <div className="hidden md:block flex-1 max-w-md mx-8">
+-            <SearchBar />
++          {/* Auth/Profile Section */}
++          <div className="flex items-center space-x-4">
++            {session ? (
++              <div className="relative">
++                <button
++                  onClick={() => setIsProfileOpen(!isProfileOpen)}
++                  className="flex items-center space-x-2 text-gray-700 hover:text-primary-600"
++                >
++                  {session.user.image ? (
++                    <img
++                      src={session.user.image}
++                      alt={session.user.name || 'User'}
++                      className="w-8 h-8 rounded-full"
++                    />
++                  ) : (
++                    <div className="w-8 h-8 bg-primary-100 rounded-full flex items-center justify-center">
++                      <User className="w-4 h-4 text-primary-600" />
++                    </div>
++                  )}
++                  <ChevronDown className="w-4 h-4" />
++                </button>
++
++                {isProfileOpen && (
++                  <div className="absolute right-0 top-full mt-2 w-64 bg-white border border-gray-200 rounded-lg shadow-xl py-2">
++                    <div className="px-4 py-3 border-b border-gray-200">
++                      <p className="font-medium text-gray-900">{session.user.name}</p>
++                      <p className="text-sm text-gray-600">{session.user.email}</p>
++                    </div>
++                    <Link href="/profile" className="flex items-center space-x-3 px-4 py-3 text-gray-700 hover:bg-gray-50">
++                      <User className="w-4 h-4" />
++                      <span>Your Profile</span>
++                    </Link>
++                    <Link href="/profile/orders" className="flex items-center space-x-3 px-4 py-3 text-gray-700 hover:bg-gray-50">
++                      <Package className="w-4 h-4" />
++                      <span>Orders</span>
++                    </Link>
++                    <Link href="/profile/wishlist" className="flex items-center space-x-3 px-4 py-3 text-gray-700 hover:bg-gray-50">
++                      <Heart className="w-4 h-4" />
++                      <span>Wishlist</span>
++                    </Link>
++                    <Link href="/profile/addresses" className="flex items-center space-x-3 px-4 py-3 text-gray-700 hover:bg-gray-50">
++                      <MapPin className="w-4 h-4" />
++                      <span>Saved Addresses</span>
++                    </Link>
++                    <Link href="/profile/notifications" className="flex items-center space-x-3 px-4 py-3 text-gray-700 hover:bg-gray-50">
++                      <Bell className="w-4 h-4" />
++                      <span>Notifications</span>
++                    </Link>
++                    <button
++                      onClick={() => signOut()}
++                      className="flex items-center space-x-3 px-4 py-3 text-red-600 hover:bg-red-50 w-full text-left"
++                    >
++                      <LogOut className="w-4 h-4" />
++                      <span>Logout</span>
++                    </button>
++                  </div>
++                )}
++              </div>
++            ) : (
++              <div className="hidden md:flex items-center space-x-4">
++                <button
++                  onClick={() => signIn()}
++                  className="text-gray-700 hover:text-primary-600 transition-colors"
++                >
++                  Login
++                </button>
++                <Link
++                  href="/auth/signup"
++                  className="bg-primary-600 text-white px-4 py-2 rounded-lg hover:bg-primary-700 transition-colors"
++                >
++                  Sign Up
++                </Link>
++              </div>
++            )}
++
++            {/* Cart */}
++            <Link href="/cart" className="relative">
++              <ShoppingBag className="w-6 h-6 text-gray-700 hover:text-primary-600 transition-colors" />
++              {getItemCount() > 0 && (
++                <span className="absolute -top-2 -right-2 bg-primary-600 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
++                  {getItemCount()}
++                </span>
++              )}
++            </Link>
++
++            {/* Mobile Menu */}
++            <MobileNav />
+           </div>
+-
+-          {/* User Actions */}
+-          <div className="flex items-center gap-4">
+-            <div className="hidden md:flex items-center space-x-4">
+-              {/* Cart */}
+-              <Link href={ROUTES.CART} className="relative">
++        </div>
++      </div>
++    </header>
++  )
++}
+                 <svg className="w-6 h-6 text-gray-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 3h2l.4 2M7 13h10l4-8H5.4m0 0L7 13m0 0l-1.1 5H19M7 13v8a2 2 0 002 2h10a2 2 0 002-2v-3" />
+                 </svg>
+                 {getItemCount() > 0 && (
+diff --git a/components/home/EventCategoriesGrid.tsx b/components/home/EventCategoriesGrid.tsx
+--- components/home/EventCategoriesGrid.tsx
++++ components/home/EventCategoriesGrid.tsx
+@@ -1,9 +1,116 @@
++'use client'
++
++import { useEffect, useState } from 'react'
++import { motion } from 'framer-motion'
++import Link from 'next/link'
++import Image from 'next/image'
++
++interface EventCategory {
++  id: string
++  slug: string
++  name: string
++  description: string | null
++  cover_image_url: string | null
++}
++
+ export default function EventCategoriesGrid() {
++  const [categories, setCategories] = useState<EventCategory[]>([])
++  const [loading, setLoading] = useState(true)
++
++  useEffect(() => {
++    async function fetchCategories() {
++      try {
++        const response = await fetch('/api/event-categories')
++        const data = await response.json()
++        setCategories(data)
++      } catch (error) {
++        console.error('Failed to fetch categories:', error)
++      } finally {
++        setLoading(false)
++      }
++    }
++
++    fetchCategories()
++  }, [])
++
++  if (loading) {
++    return (
++      <section className="py-16 px-4">
++        <div className="max-w-7xl mx-auto">
++          <div className="text-center mb-12">
++            <h2 className="text-3xl font-bold text-gray-900 mb-4">Celebrate Every Occasion</h2>
++            <p className="text-gray-600">From intimate gatherings to grand celebrations</p>
++          </div>
++          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-6">
++            {Array.from({ length: 15 }).map((_, i) => (
++              <div key={i} className="aspect-[4/3] bg-gray-200 rounded-lg animate-pulse" />
++            ))}
++          </div>
++        </div>
++      </section>
++    )
++  }
++
+   return (
+-    <section className="py-12">
+-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+-        {/* Event categories will be rendered here */}
++    <section className="py-16 px-4">
++      <div className="max-w-7xl mx-auto">
++        <div className="text-center mb-12">
++          <h2 className="text-3xl font-bold text-gray-900 mb-4">Celebrate Every Occasion</h2>
++          <p className="text-gray-600">From intimate gatherings to grand celebrations</p>
++        </div>
++
++        <motion.div
++          className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-6"
++          initial="hidden"
++          whileInView="visible"
++          viewport={{ once: true, margin: "-100px" }}
++          variants={{
++            hidden: {},
++            visible: {
++              transition: {
++                staggerChildren: 0.05
++              }
++            }
++          }}
++        >
++          {categories.map((category, index) => (
++            <motion.div
++              key={category.id}
++              variants={{
++                hidden: { opacity: 0, y: 40 },
++                visible: { opacity: 1, y: 0 }
++              }}
++              transition={{ duration: 0.6, ease: [0.25, 0.46, 0.45, 0.94] }}
++            >
++              <Link href={`/events/${category.slug}`}>
++                <div className="group relative aspect-[4/3] overflow-hidden rounded-lg bg-gray-200">
++                  {category.cover_image_url ? (
++                    <Image
++                      src={category.cover_image_url}
++                      alt={category.name}
++                      fill
++                      className="object-cover transition-transform duration-300 group-hover:scale-110"
++                    />
++                  ) : (
++                    <div className="w-full h-full bg-gradient-to-br from-purple-400 to-pink-400 flex items-center justify-center">
++                      <span className="text-white font-semibold text-lg">{category.name}</span>
++                    </div>
++                  )}
++
++                  <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
++
++                  <div className="absolute bottom-0 left-0 right-0 p-4">
++                    <h3 className="text-white font-semibold text-lg mb-1">{category.name}</h3>
++                    <div className="opacity-0 group-hover:opacity-100 transition-opacity duration-300">
++                      <span className="text-white/90 text-sm">Explore →</span>
++                    </div>
++                  </div>
++                </div>
++              </Link>
++            </motion.div>
++          ))}
++        </motion.div>
+       </div>
+     </section>
+   )
+ }
+diff --git a/app/api/event-categories/route.ts b/app/api/event-categories/route.ts
+new file mode 100644
+--- /dev/null
++++ b/app/api/event-categories/route.ts
+@@ -0,0 +1,22 @@
++import { supabase } from '@/lib/supabase'
++import { NextResponse } from 'next/server'
++
++export async function GET() {
++  try {
++    const { data, error } = await supabase
++      .from('event_categories')
++      .select('*')
++      .eq('is_active', true)
++      .order('display_order')
++
++    if (error) {
++      console.error('Error fetching event categories:', error)
++      return NextResponse.json({ error: 'Failed to fetch categories' }, { status: 500 })
++    }
++
++    return NextResponse.json(data)
++  } catch (error) {
++    console.error('API error:', error)
++    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
++  }
++}
+\ No newline at end of filediff --git a/components/home/FeaturedPackages.tsx b/components/home/FeaturedPackages.tsx
+--- components/home/FeaturedPackages.tsx
++++ components/home/FeaturedPackages.tsx
+@@ -1,9 +1,97 @@
++'use client'
++
++import { useEffect, useState } from 'react'
++import Link from 'next/link'
++import { ProductCard } from '@/components/events/ProductCard'
++
++interface Product {
++  id: string
++  name: string
++  price: number
++  discounted_price: number | null
++  images: string[]
++  category_id: string
++  event_categories: {
++    name: string
++  }
++  reviews: Array<{ rating: number }>
++}
++
+ export default function FeaturedPackages() {
++  const [products, setProducts] = useState<Product[]>([])
++  const [loading, setLoading] = useState(true)
++
++  useEffect(() => {
++    async function fetchFeaturedProducts() {
++      try {
++        const response = await fetch('/api/products/featured')
++        const data = await response.json()
++        setProducts(data)
++      } catch (error) {
++        console.error('Failed to fetch featured products:', error)
++      } finally {
++        setLoading(false)
++      }
++    }
++
++    fetchFeaturedProducts()
++  }, [])
++
++  if (loading) {
++    return (
++      <section className="py-16 px-4">
++        <div className="max-w-7xl mx-auto">
++          <div className="text-center mb-8">
++            <h2 className="text-3xl font-bold text-gray-900 mb-4">Popular Packages</h2>
++          </div>
++          <div className="flex space-x-6 overflow-x-auto pb-4">
++            {Array.from({ length: 4 }).map((_, i) => (
++              <div key={i} className="flex-shrink-0 w-80">
++                <div className="bg-gray-200 rounded-lg aspect-[4/3] animate-pulse mb-4" />
++                <div className="h-4 bg-gray-200 rounded animate-pulse mb-2" />
++                <div className="h-4 bg-gray-200 rounded animate-pulse w-3/4" />
++              </div>
++            ))}
++          </div>
++        </div>
++      </section>
++    )
++  }
++
++  if (products.length === 0) {
++    return null
++  }
++
+   return (
+-    <section className="py-12">
+-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+-        {/* Featured packages will be rendered here */}
++    <section className="py-16 px-4">
++      <div className="max-w-7xl mx-auto">
++        <div className="flex items-center justify-between mb-8">
++          <h2 className="text-3xl font-bold text-gray-900">Popular Packages</h2>
++          <Link
++            href="/events"
++            className="text-primary-600 hover:text-primary-700 font-medium transition-colors"
++          >
++            View All →
++          </Link>
++        </div>
++
++        <div className="flex space-x-6 overflow-x-auto pb-4 scrollbar-hide">
++          {products.map((product) => (
++            <div key={product.id} className="flex-shrink-0 w-80">
++              <ProductCard
++                product={{
++                  ...product,
++                  category_name: product.event_categories.name,
++                  avgRating: product.reviews.length > 0
++                    ? product.reviews.reduce((sum, r) => sum + r.rating, 0) / product.reviews.length
++                    : null,
++                  reviewCount: product.reviews.length
++                }}
++              />
++            </div>
++          ))}
++        </div>
+       </div>
+     </section>
+   )
+ }
+diff --git a/app/api/products/featured/route.ts b/app/api/products/featured/route.ts
+new file mode 100644
+--- /dev/null
++++ b/app/api/products/featured/route.ts
+@@ -0,0 +1,36 @@
++import { supabase } from '@/lib/supabase'
++import { NextResponse } from 'next/server'
++
++export async function GET() {
++  try {
++    const { data, error } = await supabase
++      .from('products')
++      .select(`
++        id,
++        name,
++        price,
++        discounted_price,
++        images,
++        category_id,
++        event_categories (
++          name
++        ),
++        reviews (
++          rating
++        )
++      `)
++      .eq('is_available', true)
++      .order('created_at', { ascending: false })
++      .limit(8)
++
++    if (error) {
++      console.error('Error fetching featured products:', error)
++      return NextResponse.json({ error: 'Failed to fetch products' }, { status: 500 })
++    }
++
++    return NextResponse.json(data)
++  } catch (error) {
++    console.error('API error:', error)
++    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
++  }
++}
+\ No newline at end of filediff --git a/lib/supabase.ts b/lib/supabase.ts
+--- lib/supabase.ts
++++ lib/supabase.ts
+@@ -1,34 +1,83 @@
+ /**
+- * Neon PostgreSQL Database Client
+- * Replaces Supabase with direct PostgreSQL connection
+- * 
+- * Usage:
+- * - Server-side: Use db.query() for direct queries
+- * - For ORM: Consider adding Prisma or Drizzle
++ * Neon PostgreSQL helper utilities.
++ *
++ * This file exposes a direct Neon database pool and also preserves
++ * legacy Supabase client helpers when Supabase environment variables are configured.
+  */
+ 
+ import { Pool, QueryResult } from 'pg'
+ import { cache } from 'react'
++import { cookies } from 'next/headers'
++import { createClient } from '@supabase/supabase-js'
++import { createServerClient } from '@supabase/auth-helpers-nextjs'
+ 
+-// Database connection pool
++const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL
++const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY
++const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
++const neonDatabaseUrl = process.env.NEON_DATABASE_URL || process.env.DATABASE_URL
++const neonDirectDatabaseUrl = process.env.NEON_DIRECT_DATABASE_URL || process.env.DIRECT_DATABASE_URL || neonDatabaseUrl
++
++if (!neonDatabaseUrl) {
++  throw new Error('Missing Neon database environment variables: NEON_DATABASE_URL or DATABASE_URL')
++}
++
++if (!supabaseUrl || !supabaseAnonKey || !supabaseServiceRoleKey) {
++  console.warn('Supabase environment variables not detected. Legacy Supabase clients will remain available if configured, but the Neon database pool will still connect via DATABASE_URL.')
++}
++
++export const supabase = supabaseUrl && supabaseAnonKey
++  ? createClient(supabaseUrl, supabaseAnonKey, {
++      auth: {
++        autoRefreshToken: true,
++        persistSession: true,
++      },
++    })
++  : null
++
++export const supabaseAdmin = supabaseUrl && supabaseServiceRoleKey
++  ? createClient(supabaseUrl, supabaseServiceRoleKey, {
++      auth: {
++        autoRefreshToken: false,
++        persistSession: false,
++      },
++    })
++  : null
++
++export const createClientServer = cache(() => {
++  if (!supabaseUrl || !supabaseAnonKey) {
++    throw new Error('Supabase server client requires NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY')
++  }
++
++  return createServerClient(supabaseUrl, supabaseAnonKey, {
++    cookies: {
++      getAll: () => cookies().getAll().map((cookie) => ({
++        name: cookie.name,
++        value: cookie.value,
++        options: {},
++      })),
++    },
++  })
++})
++
++export const createServiceRoleClient = () => {
++  if (!supabaseAdmin) {
++    throw new Error('Supabase service role client requires SUPABASE_SERVICE_ROLE_KEY')
++  }
++  return supabaseAdmin
++}
++
++// Database connection pool for direct SQL examples
+ const pool = new Pool({
+-  connectionString: process.env.DATABASE_URL,
++  connectionString: neonDirectDatabaseUrl,
+   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+   max: 20,
+ })
+ 
+-// Error handling
+ pool.on('error', (err) => {
+   console.error('Unexpected error on idle client', err)
+ })
+ 
+-/**
+- * Execute a query with parameters
+- * @param text SQL query string
+- * @param params Query parameters
+- * @returns Query result
+- */
+ export const query = async (text: string, params?: any[]): Promise<QueryResult> => {
+   const start = Date.now()
+   try {
+     const result = await pool.query(text, params)
+@@ -40,20 +89,13 @@
+     throw error
+   }
+ }
+ 
+-/**
+- * Get a client from the pool for transactions
+- */
+ export const getClient = async () => {
+   const client = await pool.connect()
+   return client
+ }
+ 
+-/**
+- * Execute multiple queries in a transaction
+- * @param queries Array of {text, params} objects
+- */
+ export const transaction = async (queries: Array<{ text: string; params?: any[] }>) => {
+   const client = await pool.connect()
+   try {
+     await client.query('BEGIN')
+@@ -71,18 +113,12 @@
+     client.release()
+   }
+ }
+ 
+-/**
+- * Close the connection pool
+- */
+ export const closePool = async () => {
+   await pool.end()
+ }
+ 
+-/**
+- * Health check for database connection
+- */
+ export const healthCheck = async (): Promise<boolean> => {
+   try {
+     await pool.query('SELECT NOW()')
+     return true
+@@ -91,15 +127,11 @@
+     return false
+   }
+ }
+ 
+-// Cached database instance for server operations
+ export const db = cache(() => ({
+   query,
+   getClient,
+   transaction,
+ }))
+ 
+-/**
+- * Re-export pool for advanced usage
+- */
+ export default pool
+\ No newline at end of file
+diff --git a/app/cart/page.tsx b/app/cart/page.tsx
+--- app/cart/page.tsx
++++ app/cart/page.tsx
+@@ -55,16 +55,14 @@
+     })
+ 
+     if (!response.ok) {
+       const payload = await response.json()
+-      return { success: false, message: payload.error ; 'Invalid coupon' }
+-    }
++        return { success: false, message: payload.error ?? 'Invalid coupon' }
++      }
+ 
+-    const payload = await response.json()
+-    setCoupon({ code: payload.code, discount: payload.discount })
+-    return { success: true, message: payload.message ; 'Coupon applied' }
+-  }
+-
++      const payload = await response.json()
++      setCoupon({ code: payload.code, discount: payload.discount })
++      return { success: true, message: payload.message ?? 'Coupon applied' }
+   const handleRemoveCoupon = () => setCoupon(undefined)
+ 
+   const handleRemoveItem = async (cartItemId: string) => {
+     const item = items.find((entry) => entry.id === cartItemId)
+@@ -116,9 +114,9 @@
+       })
+     }
+   }
+ 
+-  const checkoutDisabled = items.length === 0 ; items.some((item) => !item.event_date)
++  const checkoutDisabled = items.length === 0 || items.some((item) => !item.event_date)
+ 
+   return (
+     <div className="min-h-screen bg-slate-50 py-12">
+       <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+diff --git a/components/ui/Breadcrumb.tsx b/components/ui/Breadcrumb.tsx
+--- components/ui/Breadcrumb.tsx
++++ components/ui/Breadcrumb.tsx
+@@ -1,7 +1,20 @@
+-export default function Breadcrumb() {
++interface BreadcrumbItem {
++  name: string
++  href: string
++}
++
++interface BreadcrumbProps {
++  items: BreadcrumbItem[]
++}
++
++export default function Breadcrumb({ items }: BreadcrumbProps) {
+   return (
+     <nav aria-label="Breadcrumb" className="flex gap-2">
+-      {/* Breadcrumb items will be rendered here */}
++      {items.map((item, index) => (
++        <a key={`${item.name}-${index}`} href={item.href} className="text-sm font-medium text-white/90 hover:text-white">
++          {item.name}
++        </a>
++      ))}
+     </nav>
+   )
+ }

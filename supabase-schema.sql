@@ -199,11 +199,18 @@ ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.reviews ENABLE ROW LEVEL SECURITY;
 
--- Profiles: users can only SELECT/UPDATE their own row
+-- Profiles: users can only SELECT/UPDATE their own row, admins can do everything
 CREATE POLICY "Users can view own profile" ON public.profiles
   FOR SELECT USING (auth.uid() = id);
 CREATE POLICY "Users can update own profile" ON public.profiles
   FOR UPDATE USING (auth.uid() = id);
+CREATE POLICY "Admins can manage all profiles" ON public.profiles
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles
+      WHERE id = auth.uid() AND role = 'admin'
+    )
+  );
 
 -- Addresses: users can only CRUD their own addresses
 CREATE POLICY "Users can view own addresses" ON public.addresses
@@ -235,15 +242,61 @@ CREATE POLICY "Users can update own wishlist items" ON public.wishlist_items
 CREATE POLICY "Users can delete own wishlist items" ON public.wishlist_items
   FOR DELETE USING (auth.uid() = user_id);
 
--- Orders: users can only SELECT their own orders
+-- Orders: users can only SELECT their own orders, admins can manage all
 CREATE POLICY "Users can view own orders" ON public.orders
   FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Admins can manage all orders" ON public.orders
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles
+      WHERE id = auth.uid() AND role = 'admin'
+    )
+  );
+
+-- Order Items: users can view their own order items, admins can manage all
+CREATE POLICY "Users can view own order items" ON public.order_items
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM public.orders
+      WHERE orders.id = order_items.order_id AND orders.user_id = auth.uid()
+    )
+  );
+CREATE POLICY "Admins can manage all order items" ON public.order_items
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles
+      WHERE id = auth.uid() AND role = 'admin'
+    )
+  );
+
+-- Order Tracking: users can view their own order tracking, admins can manage all
+CREATE POLICY "Users can view own order tracking" ON public.order_tracking
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM public.orders
+      WHERE orders.id = order_tracking.order_id AND orders.user_id = auth.uid()
+    )
+  );
+CREATE POLICY "Admins can manage all order tracking" ON public.order_tracking
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles
+      WHERE id = auth.uid() AND role = 'admin'
+    )
+  );
 
 -- Notifications: users can only SELECT/UPDATE their own notifications
 CREATE POLICY "Users can view own notifications" ON public.notifications
   FOR SELECT USING (auth.uid() = user_id);
 CREATE POLICY "Users can update own notifications" ON public.notifications
   FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "Admins can manage all notifications" ON public.notifications
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles
+      WHERE id = auth.uid() AND role = 'admin'
+    )
+  );
 
 -- Reviews: INSERT only if is_verified_purchase = true (checked via function)
 CREATE POLICY "Anyone can view reviews" ON public.reviews
@@ -253,14 +306,63 @@ CREATE POLICY "Verified users can insert reviews" ON public.reviews
     auth.uid() = user_id AND
     is_verified_purchase = true
   );
+CREATE POLICY "Users can update own reviews" ON public.reviews
+  FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "Users can delete own reviews" ON public.reviews
+  FOR DELETE USING (auth.uid() = user_id);
 
--- Products, event_categories, gallery_items: public SELECT
+-- Products, event_categories, gallery_items: public SELECT, admins can manage
 CREATE POLICY "Anyone can view products" ON public.products
   FOR SELECT USING (true);
+CREATE POLICY "Admins can manage products" ON public.products
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles
+      WHERE id = auth.uid() AND role = 'admin'
+    )
+  );
+
 CREATE POLICY "Anyone can view event categories" ON public.event_categories
   FOR SELECT USING (true);
+CREATE POLICY "Admins can manage event categories" ON public.event_categories
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles
+      WHERE id = auth.uid() AND role = 'admin'
+    )
+  );
+
 CREATE POLICY "Anyone can view gallery items" ON public.gallery_items
   FOR SELECT USING (true);
+CREATE POLICY "Admins can manage gallery items" ON public.gallery_items
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles
+      WHERE id = auth.uid() AND role = 'admin'
+    )
+  );
+
+-- Coupons: public SELECT for active coupons, admins can manage
+CREATE POLICY "Anyone can view active coupons" ON public.coupons
+  FOR SELECT USING (is_active = true);
+CREATE POLICY "Admins can manage coupons" ON public.coupons
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles
+      WHERE id = auth.uid() AND role = 'admin'
+    )
+  );
+
+-- Contact submissions: anyone can insert, admins can view/manage
+CREATE POLICY "Anyone can submit contact forms" ON public.contact_submissions
+  FOR INSERT WITH CHECK (true);
+CREATE POLICY "Admins can manage contact submissions" ON public.contact_submissions
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM public.profiles
+      WHERE id = auth.uid() AND role = 'admin'
+    )
+  );
 
 -- FUNCTIONS
 
@@ -268,7 +370,7 @@ CREATE POLICY "Anyone can view gallery items" ON public.gallery_items
 CREATE OR REPLACE FUNCTION update_products_search_vector()
 RETURNS TRIGGER AS $$
 BEGIN
-  NEW.search_vector = 
+  NEW.search_vector =
     setweight(to_tsvector('english', COALESCE(NEW.name, '')), 'A') ||
     setweight(to_tsvector('english', COALESCE(NEW.description, '')), 'B') ||
     setweight(to_tsvector('english', array_to_string(NEW.tags, ' ')), 'C');
@@ -316,6 +418,10 @@ CREATE TRIGGER update_orders_updated_at
   BEFORE UPDATE ON public.orders
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+CREATE TRIGGER update_products_updated_at
+  BEFORE UPDATE ON public.products
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
 -- Auto-create profile row on auth.users INSERT
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS TRIGGER AS $$
@@ -330,18 +436,40 @@ CREATE TRIGGER on_auth_user_created
   AFTER INSERT ON auth.users
   FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 
--- Get product rating function
+-- Get product rating function - returns NULL if no reviews exist
 CREATE OR REPLACE FUNCTION get_product_rating(product_id UUID)
 RETURNS TABLE(avg_rating NUMERIC, review_count BIGINT) AS $$
 BEGIN
-  RETURN QUERY
-  SELECT
-    ROUND(AVG(rating)::NUMERIC, 1) as avg_rating,
-    COUNT(*) as review_count
-  FROM public.reviews
-  WHERE reviews.product_id = $1 AND is_verified_purchase = true;
+  -- Only return results if there are reviews
+  IF EXISTS (SELECT 1 FROM public.reviews WHERE reviews.product_id = $1 AND is_verified_purchase = true) THEN
+    RETURN QUERY
+    SELECT
+      ROUND(AVG(rating)::NUMERIC, 1) as avg_rating,
+      COUNT(*) as review_count
+    FROM public.reviews
+    WHERE reviews.product_id = $1 AND is_verified_purchase = true;
+  ELSE
+    -- Return NULL values if no reviews
+    RETURN QUERY SELECT NULL::NUMERIC, NULL::BIGINT;
+  END IF;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Function to check if user can review a product (has completed order)
+CREATE OR REPLACE FUNCTION can_user_review_product(user_id UUID, product_id UUID, order_id UUID)
+RETURNS BOOLEAN AS $$
+BEGIN
+  RETURN EXISTS (
+    SELECT 1 FROM public.orders o
+    JOIN public.order_items oi ON o.id = oi.order_id
+    WHERE o.user_id = $1
+      AND oi.product_id = $2
+      AND o.id = $3
+      AND o.status = 'completed'
+      AND o.payment_status = 'paid'
+  );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 -- INDEXES
 CREATE INDEX IF NOT EXISTS idx_products_category_id ON public.products(category_id);
@@ -360,4 +488,4 @@ CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON public.notifications(use
 CREATE INDEX IF NOT EXISTS idx_coupons_code ON public.coupons(code);
 CREATE INDEX IF NOT EXISTS idx_gallery_items_category_id ON public.gallery_items(category_id);
 CREATE INDEX IF NOT EXISTS idx_event_categories_slug ON public.event_categories(slug);
-$$ LANGUAGE plpgsql;
+CREATE INDEX IF NOT EXISTS idx_contact_submissions_created_at ON public.contact_submissions(created_at DESC);

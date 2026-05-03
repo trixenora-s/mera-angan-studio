@@ -1,5 +1,6 @@
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 
 -- USERS (extends Supabase auth.users)
 CREATE TABLE public.profiles (
@@ -8,6 +9,7 @@ CREATE TABLE public.profiles (
   phone TEXT UNIQUE,
   avatar_url TEXT,
   email TEXT UNIQUE NOT NULL,
+  role TEXT DEFAULT 'user' CHECK (role IN ('user', 'admin')),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -51,7 +53,9 @@ CREATE TABLE public.products (
   duration_hours INTEGER,  -- setup + event duration
   is_available BOOLEAN DEFAULT TRUE,
   stock_count INTEGER DEFAULT 99,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  search_vector tsvector,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- REVIEWS (only from verified purchasers)
@@ -173,6 +177,19 @@ CREATE TABLE public.gallery_items (
   is_featured BOOLEAN DEFAULT FALSE
 );
 
+-- CONTACT SUBMISSIONS
+CREATE TABLE IF NOT EXISTS public.contact_submissions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  full_name TEXT NOT NULL,
+  email TEXT NOT NULL,
+  phone TEXT,
+  event_type TEXT,
+  event_date DATE,
+  budget_range TEXT,
+  message TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- RLS POLICIES
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.addresses ENABLE ROW LEVEL SECURITY;
@@ -247,6 +264,22 @@ CREATE POLICY "Anyone can view gallery items" ON public.gallery_items
 
 -- FUNCTIONS
 
+-- Update search vector on products
+CREATE OR REPLACE FUNCTION update_products_search_vector()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.search_vector = 
+    setweight(to_tsvector('english', COALESCE(NEW.name, '')), 'A') ||
+    setweight(to_tsvector('english', COALESCE(NEW.description, '')), 'B') ||
+    setweight(to_tsvector('english', array_to_string(NEW.tags, ' ')), 'C');
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_products_search_vector_trigger
+  BEFORE INSERT OR UPDATE ON public.products
+  FOR EACH ROW EXECUTE FUNCTION update_products_search_vector();
+
 -- Auto-generate order_number
 CREATE OR REPLACE FUNCTION generate_order_number()
 RETURNS TEXT AS $$
@@ -308,4 +341,23 @@ BEGIN
   FROM public.reviews
   WHERE reviews.product_id = $1 AND is_verified_purchase = true;
 END;
+$$ LANGUAGE plpgsql;
+
+-- INDEXES
+CREATE INDEX IF NOT EXISTS idx_products_category_id ON public.products(category_id);
+CREATE INDEX IF NOT EXISTS idx_products_search ON public.products USING GIN(search_vector);
+CREATE INDEX IF NOT EXISTS idx_products_name_trgm ON public.products USING GIN(name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_reviews_product_id ON public.reviews(product_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_user_id ON public.reviews(user_id);
+CREATE INDEX IF NOT EXISTS idx_addresses_user_id ON public.addresses(user_id);
+CREATE INDEX IF NOT EXISTS idx_cart_items_user_id ON public.cart_items(user_id);
+CREATE INDEX IF NOT EXISTS idx_wishlist_items_user_id ON public.wishlist_items(user_id);
+CREATE INDEX IF NOT EXISTS idx_orders_user_id ON public.orders(user_id);
+CREATE INDEX IF NOT EXISTS idx_orders_created_at ON public.orders(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON public.order_items(order_id);
+CREATE INDEX IF NOT EXISTS idx_order_tracking_order_id ON public.order_tracking(order_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON public.notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_coupons_code ON public.coupons(code);
+CREATE INDEX IF NOT EXISTS idx_gallery_items_category_id ON public.gallery_items(category_id);
+CREATE INDEX IF NOT EXISTS idx_event_categories_slug ON public.event_categories(slug);
 $$ LANGUAGE plpgsql;

@@ -9,6 +9,7 @@ import { useSession } from 'next-auth/react'
 import { Product, Review } from '@/types'
 import { useState } from 'react'
 import RatingStars from '../ui/RatingStars'
+import { cn } from '@/lib/utils'
 
 interface ProductCardProps {
   product: Product & { reviews: Review[] }
@@ -37,7 +38,7 @@ export default function ProductCard({ product, className = '' }: ProductCardProp
       product_image: product.images[0],
       price: product.discounted_price || product.price,
       quantity,
-    })
+    } as any)
     setInCart(true)
   }
 

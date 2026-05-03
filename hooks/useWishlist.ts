@@ -7,7 +7,8 @@ interface WishlistState {
   clearWishlist: () => void
 }
 
-export const useWishlist = create<WishlistState>()(
+export const useWishlist = create<WishlistState>()
+export const useWishlistStore = useWishlist(
   persist(
     (set, get) => ({
       productIds: [],

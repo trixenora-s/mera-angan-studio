@@ -1,9 +1,35 @@
-import { AuthOptions } from 'next-auth'
+import { AuthOptions, type DefaultSession } from 'next-auth'
 import type { JWT } from 'next-auth/jwt'
 import GoogleProvider from 'next-auth/providers/google'
 import CredentialsProvider from 'next-auth/providers/credentials'
 import { createServiceRoleClient } from './supabase'
 import { consumePhoneLoginToken } from './rate-limit'
+
+declare module 'next-auth' {
+  interface Session extends DefaultSession {
+    user: DefaultSession['user'] & {
+      id: string
+      phone?: string | null
+      role?: 'user' | 'admin'
+    }
+  }
+
+  interface User {
+    id: string
+    phone?: string
+    avatar_url?: string | null
+    role?: 'user' | 'admin'
+  }
+}
+
+declare module 'next-auth/jwt' {
+  interface JWT {
+    id?: string
+    phone?: string | null
+    avatar_url?: string | null
+    role?: 'user' | 'admin'
+  }
+}
 
 export const authOptions: AuthOptions = {
   secret: process.env.NEXTAUTH_SECRET,
@@ -147,13 +173,10 @@ export const authOptions: AuthOptions = {
       return updatedToken
     },
     async session({ session, token }) {
-      session.user = {
-        id: token.id as string,
-        email: token.email as string,
-        name: token.name as string,
-        image: token.avatar_url as string | null,
-        phone: token.phone as string | null,
-        role: token.role as 'user' | 'admin' | undefined,
+      if (session.user) {
+        session.user.id = token.id as string
+        session.user.phone = token.phone as string | null
+        session.user.role = token.role as 'user' | 'admin' | undefined
       }
       return session
     },
